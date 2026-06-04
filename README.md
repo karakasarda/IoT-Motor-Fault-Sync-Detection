@@ -82,3 +82,36 @@ The pipeline writes:
 - `models\best_binary_model.joblib`
 
 Model selection uses grouped cross-validation by `session_id`. Random window split results are written only as leakage diagnostics.
+
+## Hard Validation
+
+Run stricter validation checks on the existing synchronized sessions:
+
+```powershell
+python tools\run_validation_suite.py --data-dir data\sync_captures --target binary --seed 42
+```
+
+The validation suite writes:
+
+- `reports\validation\loso_results.csv`
+- `reports\validation\anomaly_family_holdout.csv`
+- `reports\validation\time_order_split.csv`
+- `reports\validation\validation_summary.md`
+
+These checks use leave-one-session-out, leave-one-anomaly-family-out, and time-order splits. They are stricter than random window splits, but they are still based on the same collection day and hardware setup.
+
+## Live Binary Alarm
+
+Use the trained local model artifact for a terminal-based live normal/anomaly alarm:
+
+```powershell
+python tools\live_binary_alarm.py --imu-port COM5 --model models\best_binary_model.joblib --window-size 15 --step 1 --soft-reset
+```
+
+Hardware-free replay mode:
+
+```powershell
+python tools\live_binary_alarm.py --replay-session data\sync_captures\normal1\fused_imu_thermal.csv --model models\best_binary_model.joblib
+```
+
+The alarm uses a rolling 15-second window and switches to `anomaly` when at least 3 of the last 5 predictions are anomaly.
