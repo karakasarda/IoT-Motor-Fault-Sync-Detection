@@ -1,0 +1,16 @@
+{
+  "imu_rows": 2881,
+  "thermal_frames": 90,
+  "fused_rows": 2881,
+  "alignment_mode": "shared_host_elapsed_s_interpolation",
+  "imu_duration_s": 89.98578180000186,
+  "imu_sample_rate_hz": 32.0161690254931,
+  "thermal_duration_s": 89.00613209999574,
+  "thermal_interval_s_mean": 1.000068899999952,
+  "thermal_interval_s_max": 1.1520768999907887,
+  "nearest_thermal_frame_dt_s_mean": 0.2527429440123885,
+  "nearest_thermal_frame_dt_s_p95": 0.4881891999975778,
+  "nearest_thermal_frame_dt_s_max": 0.765705000012531,
+  "errors": [],
+  "output_dir": "D:\\Projects\\motor_anomali\\IoT-Motor-Fault-Sync-Detection\\data\\sync_captures\\vibration1"
+}

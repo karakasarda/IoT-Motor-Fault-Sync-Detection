@@ -1,0 +1,16 @@
+{
+  "imu_rows": 2884,
+  "thermal_frames": 90,
+  "fused_rows": 2884,
+  "alignment_mode": "shared_host_elapsed_s_interpolation",
+  "imu_duration_s": 89.9757099999988,
+  "imu_sample_rate_hz": 32.0530952186989,
+  "thermal_duration_s": 88.98086739999417,
+  "thermal_interval_s_mean": 0.9997850269662266,
+  "thermal_interval_s_max": 1.2256911000004038,
+  "nearest_thermal_frame_dt_s_mean": 0.2533357828709864,
+  "nearest_thermal_frame_dt_s_p95": 0.48891501500038426,
+  "nearest_thermal_frame_dt_s_max": 0.8179681000037817,
+  "errors": [],
+  "output_dir": "D:\\Projects\\motor_anomali\\IoT-Motor-Fault-Sync-Detection\\data\\sync_captures\\mixed_anomaly2"
+}

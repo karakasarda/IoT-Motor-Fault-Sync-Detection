@@ -1,0 +1,16 @@
+{
+  "imu_rows": 2886,
+  "thermal_frames": 90,
+  "fused_rows": 2886,
+  "alignment_mode": "shared_host_elapsed_s_interpolation",
+  "imu_duration_s": 90.00514400000975,
+  "imu_sample_rate_hz": 32.064833983263085,
+  "thermal_duration_s": 88.99378249999427,
+  "thermal_interval_s_mean": 0.9999301404493738,
+  "thermal_interval_s_max": 1.2046011999918846,
+  "nearest_thermal_frame_dt_s_mean": 0.25317305349948566,
+  "nearest_thermal_frame_dt_s_p95": 0.4904198249896581,
+  "nearest_thermal_frame_dt_s_max": 0.8118148000066867,
+  "errors": [],
+  "output_dir": "D:\\Projects\\motor_anomali\\IoT-Motor-Fault-Sync-Detection\\data\\sync_captures\\damping5"
+}
