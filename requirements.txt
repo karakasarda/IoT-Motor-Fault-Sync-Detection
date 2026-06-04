@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+opencv-python
+openpyxl
+pyserial
+scikit-learn
+joblib
+seaborn
+

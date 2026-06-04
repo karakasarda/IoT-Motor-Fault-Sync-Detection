@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local logs and temporary capture artifacts
+*.log
+dashboard_server*.log
+
+# Keep synchronized summaries/CSV files, skip heavy thermal raw frames.
+data/sync_captures/*/thermal/frame_*.png
+data/sync_captures/*/thermal/frame_*_temp_c.csv
+data/sync_captures/*/imu_raw.log
+
+# Local one-off tests
+data/sensor_test/
+data/thermal_live/
+data/captures/
+
+# Large/generated model outputs can be regenerated.
+models/*.joblib
+models/*.pkl
+models/*.pt
+models/*.pth
+models/*.onnx
+
