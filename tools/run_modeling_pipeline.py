@@ -34,6 +34,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+import modeling_features as mf
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = ROOT / "data" / "sync_captures"
@@ -454,26 +456,15 @@ def model_catalog(seed):
 
 
 def feature_sets(feature_data):
-    motion = [c for c in feature_data.columns if c.startswith("motion__")]
-    pulse = [c for c in feature_data.columns if c.startswith("pulse__")]
-    thermal = [c for c in feature_data.columns if c.startswith("thermal__")]
-    return {
-        "motion_only": motion,
-        "pulse_only": pulse,
-        "thermal_only": thermal,
-        "motion_pulse": motion + pulse,
-        "motion_pulse_thermal": motion + pulse + thermal,
-    }
+    return mf.feature_sets(feature_data)
 
 
 def target_column(target):
-    return "binary_label" if target == "binary" else "source_label"
+    return mf.target_column(target)
 
 
 def label_order(y, target):
-    if target == "binary":
-        return BINARY_ORDER
-    return sorted(pd.Series(y).unique().tolist())
+    return mf.label_order(y, target)
 
 
 def metric_dict(y_true, y_pred, target):
@@ -775,8 +766,8 @@ def main():
     feature_output.parent.mkdir(parents=True, exist_ok=True)
 
     windows = [float(w) for w in args.windows]
-    records = load_sessions(data_dir)
-    feature_data = build_window_features(records, windows).copy()
+    records = mf.load_sessions(data_dir)
+    feature_data = mf.build_window_features(records, windows).copy()
     if args.target == "multiclass":
         feature_data["target_label"] = feature_data["source_label"]
     else:
