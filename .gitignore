@@ -11,6 +11,7 @@ dashboard_server*.log
 data/sync_captures/*/thermal/frame_*.png
 data/sync_captures/*/thermal/frame_*_temp_c.csv
 data/sync_captures/*/imu_raw.log
+data/sync_captures/*/status.json
 
 # Local one-off tests
 data/sensor_test/
@@ -23,4 +24,3 @@ models/*.pkl
 models/*.pt
 models/*.pth
 models/*.onnx
-

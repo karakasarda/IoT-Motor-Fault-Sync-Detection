@@ -63,3 +63,22 @@ Only collect and train from `data\sync_captures`. Do not mix old prototype data 
 
 For the full scenario order, use [docs/data_collection_plan.md](docs/data_collection_plan.md).
 
+## Binary Modeling Pipeline
+
+After collecting synchronized sessions, run the binary normal-vs-anomaly model sweep:
+
+```powershell
+python tools\run_modeling_pipeline.py --data-dir data\sync_captures --target binary --windows 2 5 10 15 --seed 42
+```
+
+The pipeline writes:
+
+- `data\processed\window_features.csv`
+- `reports\modeling\dataset_quality.md`
+- `reports\modeling\experiment_results.csv`
+- `reports\modeling\confusion_matrix_best_binary.png`
+- `reports\modeling\feature_importance_best_binary.png`
+- `reports\modeling\modeling_summary.md`
+- `models\best_binary_model.joblib`
+
+Model selection uses grouped cross-validation by `session_id`. Random window split results are written only as leakage diagnostics.
