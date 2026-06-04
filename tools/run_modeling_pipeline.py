@@ -62,7 +62,7 @@ class SessionRecord:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build window features, train binary motor anomaly models, and write reports."
+        description="Build window features, train motor anomaly models, and write reports."
     )
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--target", choices=["binary", "multiclass"], default="binary")
@@ -484,6 +484,24 @@ def metric_dict(y_true, y_pred, target):
     return result
 
 
+def selection_columns(target):
+    recall_column = "anomaly_recall" if target == "binary" else "recall_macro"
+    return ["mcc", "balanced_accuracy", recall_column, "f1_macro"]
+
+
+def sort_for_selection(results, target, include_window=False):
+    columns = []
+    ascending = []
+    if include_window:
+        columns.append("window_size_s")
+        ascending.append(True)
+    for column in selection_columns(target):
+        if column in results.columns:
+            columns.append(column)
+            ascending.append(False)
+    return results.sort_values(columns, ascending=ascending)
+
+
 def evaluate_group_cv(data, features, estimator, target, seed):
     y = data[target_column(target)].astype(str).to_numpy()
     groups = data["session_id"].astype(str).to_numpy()
@@ -589,10 +607,7 @@ def run_experiments(feature_data, target, windows, seed, report_dir):
 
     results = pd.DataFrame(result_rows)
     group_results = results[results["split_type"] == "group_cv"].copy()
-    group_results = group_results.sort_values(
-        ["window_size_s", "mcc", "balanced_accuracy", "anomaly_recall", "f1_macro"],
-        ascending=[True, False, False, False, False],
-    )
+    group_results = sort_for_selection(group_results, target, include_window=True)
     labels = label_order(feature_data[target_column(target)], target)
     for window_size, window_results in group_results.groupby("window_size_s"):
         best = window_results.iloc[0]
@@ -611,10 +626,7 @@ def run_experiments(feature_data, target, windows, seed, report_dir):
             encoding="utf-8",
         )
 
-    best = group_results.sort_values(
-        ["mcc", "balanced_accuracy", "anomaly_recall", "f1_macro"],
-        ascending=[False, False, False, False],
-    ).iloc[0]
+    best = sort_for_selection(group_results, target).iloc[0]
     best_key = (float(best["window_size_s"]), best["feature_set"], best["model"], "group_cv")
     best_predictions = predictions_by_key[best_key]
     return results, best, best_predictions
@@ -696,16 +708,16 @@ def write_feature_importance(feature_data, best, target, seed, columns, report_d
         importance_df["plot_importance"] = importance_df["permutation_importance_mean"]
         plot_label = "permutation_importance"
     importance_df = importance_df.sort_values("plot_importance", ascending=False)
-    importance_df.to_csv(report_dir / "feature_importance_best_binary.csv", index=False)
+    importance_df.to_csv(report_dir / f"feature_importance_best_{target}.csv", index=False)
 
     top = importance_df.head(25).iloc[::-1]
     plt.figure(figsize=(10, max(5, len(top) * 0.32)))
     xerr = top["permutation_importance_std"] if plot_label == "permutation_importance" else None
     plt.barh(top["feature"], top["plot_importance"], xerr=xerr, color="#2563eb")
     plt.xlabel(plot_label)
-    plt.title("Best binary model feature importance")
+    plt.title(f"Best {target} model feature importance")
     plt.tight_layout()
-    plt.savefig(report_dir / "feature_importance_best_binary.png", dpi=180)
+    plt.savefig(report_dir / f"feature_importance_best_{target}.png", dpi=180)
     plt.close()
     return importance_df
 
@@ -734,7 +746,7 @@ def write_modeling_summary(results, best, best_predictions, target, report_dir, 
         "",
         "## Group-CV Top Results",
         "",
-        group_results.sort_values(["mcc", "balanced_accuracy", "anomaly_recall", "f1_macro"], ascending=False)
+        sort_for_selection(group_results, target)
         .head(20)
         .round(4)
         .pipe(markdown_table),
@@ -743,14 +755,14 @@ def write_modeling_summary(results, best, best_predictions, target, report_dir, 
         "",
         "These rows use random window splits and are diagnostic only. They must not be used for model selection.",
         "",
-        random_results.sort_values(["mcc", "balanced_accuracy", "anomaly_recall", "f1_macro"], ascending=False)
+        sort_for_selection(random_results, target)
         .head(20)
         .round(4)
         .pipe(markdown_table),
         "",
     ]
     (report_dir / "modeling_summary.md").write_text("\n".join(lines), encoding="utf-8")
-    (report_dir / "classification_report_best_binary.txt").write_text(
+    (report_dir / f"classification_report_best_{target}.txt").write_text(
         classification_report(best_predictions["true_label"], best_predictions["pred_label"], labels=labels, zero_division=0),
         encoding="utf-8",
     )
@@ -761,7 +773,10 @@ def main():
     data_dir = Path(args.data_dir)
     feature_output = Path(args.feature_output)
     report_dir = Path(args.report_dir)
-    model_path = Path(args.model_output)
+    if args.target == "multiclass" and args.model_output == str(DEFAULT_MODEL_PATH):
+        model_path = ROOT / "models" / "best_multiclass_model.joblib"
+    else:
+        model_path = Path(args.model_output)
     report_dir.mkdir(parents=True, exist_ok=True)
     feature_output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -786,8 +801,8 @@ def main():
         best_predictions["true_label"],
         best_predictions["pred_label"],
         labels,
-        "Best binary model group-CV confusion matrix",
-        report_dir / "confusion_matrix_best_binary.png",
+        f"Best {args.target} model group-CV confusion matrix",
+        report_dir / f"confusion_matrix_best_{args.target}.png",
     )
     artifact, _, columns = train_final_model(feature_data, best, args.target, args.seed, model_path)
     write_feature_importance(feature_data, best, args.target, args.seed, columns, report_dir)
@@ -804,7 +819,8 @@ def main():
                 "model": best["model"],
                 "mcc": float(best["mcc"]),
                 "balanced_accuracy": float(best["balanced_accuracy"]),
-                "anomaly_recall": float(best.get("anomaly_recall", math.nan)),
+                "recall": float(best["anomaly_recall"] if args.target == "binary" else best["recall_macro"]),
+                "recall_metric": "anomaly_recall" if args.target == "binary" else "recall_macro",
                 "f1_macro": float(best["f1_macro"]),
             },
             "feature_output": str(feature_output),

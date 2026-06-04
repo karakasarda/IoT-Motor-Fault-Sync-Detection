@@ -1,0 +1,602 @@
+import argparse
+import asyncio
+import json
+import math
+import os
+import socket
+import sys
+import time
+from collections import deque
+from pathlib import Path
+
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+
+import pandas as pd
+import serial
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+import modeling_features as mf
+from capture_vibration import format_serial_error, parse_stream_line, prepare_stream
+from llm_interpreter import generate_operator_summary, ollama_status
+from tcam_capture import decode_radiometric, get_single_response
+from xai_explainer import (
+    explain_window,
+    global_feature_importance,
+    json_safe,
+    load_artifact,
+    load_feature_baseline,
+    predict_with_probabilities,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BINARY_MODEL = ROOT / "models" / "best_binary_model.joblib"
+DEFAULT_MULTICLASS_MODEL = ROOT / "models" / "best_multiclass_model.joblib"
+DEFAULT_FEATURE_DATA = ROOT / "data" / "processed" / "window_features.csv"
+DEFAULT_DATA_DIR = ROOT / "data" / "sync_captures"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Serve the live motor anomaly dashboard backend.")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--imu-port", help="Serial port of the Pico, for live mode.")
+    source.add_argument("--replay-session", help="Path to fused_imu_thermal.csv, for hardware-free replay.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--baudrate", type=int, default=115200)
+    parser.add_argument("--binary-model", default=str(DEFAULT_BINARY_MODEL))
+    parser.add_argument("--multiclass-model", default=str(DEFAULT_MULTICLASS_MODEL))
+    parser.add_argument("--feature-data", default=str(DEFAULT_FEATURE_DATA))
+    parser.add_argument("--window-size", type=float, default=None)
+    parser.add_argument("--step", type=float, default=1.0)
+    parser.add_argument("--history-size", type=int, default=5)
+    parser.add_argument("--alarm-threshold", type=int, default=3)
+    parser.add_argument("--soft-reset", action="store_true")
+    parser.add_argument("--thermal-host", default="192.168.4.1")
+    parser.add_argument("--thermal-port", type=int, default=5001)
+    parser.add_argument("--thermal-interval", type=float, default=1.0)
+    parser.add_argument("--ollama-model", default="llama3.1:8b")
+    parser.add_argument("--ollama-endpoint", default="http://127.0.0.1:11434/api/generate")
+    parser.add_argument("--llm-interval", type=float, default=5.0)
+    parser.add_argument("--xai-interval", type=float, default=3.0)
+    parser.add_argument("--replay-speed", type=float, default=0.0, help="0 runs as fast as possible; 1 is realtime.")
+    parser.add_argument("--once", action="store_true", help="Emit one replay prediction bundle as JSON and exit.")
+    return parser.parse_args()
+
+
+def safe_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def latest(window, column):
+    if column not in window or window.empty:
+        return None
+    return safe_float(pd.to_numeric(window[column], errors="coerce").iloc[-1])
+
+
+def mean(window, column):
+    if column not in window or window.empty:
+        return None
+    return safe_float(pd.to_numeric(window[column], errors="coerce").mean())
+
+
+def sample_rate(window):
+    if "host_elapsed_s" not in window or len(window) < 2:
+        return None
+    elapsed = pd.to_numeric(window["host_elapsed_s"], errors="coerce")
+    duration = safe_float(elapsed.max() - elapsed.min())
+    if not duration or duration <= 0:
+        return None
+    return len(window) / duration
+
+
+def telemetry_payload(window, mode, t_s):
+    return json_safe(
+        {
+            "mode": mode,
+            "timestamp_s": safe_float(t_s),
+            "gyro_mag": latest(window, "gyro_mag"),
+            "acc_mag": latest(window, "acc_mag"),
+            "pulse_rate_hz": latest(window, "pulse_rate_hz"),
+            "thermal_mean_c": latest(window, "thermal_temp_mean_c"),
+            "thermal_max_c": latest(window, "thermal_temp_max_c"),
+            "sample_rate_hz": sample_rate(window),
+            "window_rows": int(len(window)),
+            "gyro_mag_mean": mean(window, "gyro_mag"),
+            "acc_mag_mean": mean(window, "acc_mag"),
+            "pulse_rate_hz_mean": mean(window, "pulse_rate_hz"),
+        }
+    )
+
+
+def probabilities_for_artifact(window, artifact):
+    if artifact is None:
+        return None, {}
+    x, _ = mf.feature_row_for_model(window, artifact)
+    prediction, probabilities = predict_with_probabilities(artifact, x)
+    label_order = [str(label) for label in artifact.get("label_order", probabilities.keys())]
+    ordered = {label: float(probabilities.get(label, 0.0)) for label in label_order}
+    return prediction, ordered
+
+
+def alarm_label(history, threshold):
+    anomaly_votes = sum(label == mf.ANOMALY_LABEL for label in history)
+    return mf.ANOMALY_LABEL if anomaly_votes >= threshold else mf.NORMAL_LABEL
+
+
+def poll_thermal_once(host, port):
+    with socket.create_connection((host, port), timeout=4) as sock:
+        packet = get_single_response(sock, {"cmd": "get_image"}, timeout=8)
+    temp_c = decode_radiometric(packet)
+    return {
+        "thermal_temp_min_c": float(temp_c.min()),
+        "thermal_temp_mean_c": float(temp_c.mean()),
+        "thermal_temp_p95_c": float(pd.Series(temp_c.reshape(-1)).quantile(0.95)),
+        "thermal_temp_max_c": float(temp_c.max()),
+        "thermal_temp_center_c": float(temp_c[temp_c.shape[0] // 2, temp_c.shape[1] // 2]),
+    }
+
+
+def validation_warnings():
+    warnings = []
+    path = ROOT / "reports" / "validation" / "anomaly_family_holdout.csv"
+    if path.exists():
+        try:
+            data = pd.read_csv(path)
+            recall_cols = [c for c in data.columns if c.endswith("recall") or c == "recall"]
+            if "heldout_family" in data and recall_cols:
+                recall_col = recall_cols[0]
+                weak = data[pd.to_numeric(data[recall_col], errors="coerce").fillna(0) < 0.75]
+                for _, row in weak.iterrows():
+                    warnings.append(
+                        f"{row['heldout_family']} family holdout recall is below live acceptance threshold."
+                    )
+        except Exception as exc:
+            warnings.append(f"Validation warning read failed: {exc}")
+    if not warnings:
+        warnings.append("Controlled prototype: independent new-day field validation is still required.")
+    return warnings
+
+
+class DashboardRuntime:
+    def __init__(self, args):
+        self.args = args
+        self.binary_artifact = load_artifact(args.binary_model)
+        self.multiclass_artifact = None
+        self.multiclass_error = None
+        if args.multiclass_model and Path(args.multiclass_model).exists():
+            try:
+                self.multiclass_artifact = load_artifact(args.multiclass_model)
+            except Exception as exc:
+                self.multiclass_error = str(exc)
+        else:
+            self.multiclass_error = f"Multiclass model not found: {args.multiclass_model}"
+        self.binary_baseline = load_feature_baseline(args.feature_data, self.binary_artifact)
+        self.multiclass_baseline = (
+            load_feature_baseline(args.feature_data, self.multiclass_artifact)
+            if self.multiclass_artifact is not None
+            else None
+        )
+        self.binary_global_features = global_feature_importance(self.binary_artifact, top_n=16)
+        self.binary_xai_candidates = [row["feature"] for row in self.binary_global_features]
+        self.multiclass_global_features = (
+            global_feature_importance(self.multiclass_artifact, top_n=12)
+            if self.multiclass_artifact is not None
+            else []
+        )
+        self.multiclass_xai_candidates = [row["feature"] for row in self.multiclass_global_features]
+        self.history = deque(maxlen=args.history_size)
+        self.last_llm_time = 0.0
+        self.cached_llm = None
+        self.last_xai_time = 0.0
+        self.cached_xai = None
+        self.warnings = validation_warnings()
+
+    @property
+    def window_size(self):
+        return float(self.args.window_size or self.binary_artifact["window_size_s"])
+
+    def status_payload(self, mode, last_error=None):
+        ollama = ollama_status(endpoint=self.args.ollama_endpoint, timeout=1.0)
+        return json_safe(
+            {
+                "mode": mode,
+                "serial_port": self.args.imu_port,
+                "thermal_host": self.args.thermal_host,
+                "binary_model_loaded": True,
+                "binary_model": {
+                    "path": str(self.args.binary_model),
+                    "model_name": self.binary_artifact.get("model_name"),
+                    "feature_set": self.binary_artifact.get("feature_set"),
+                    "window_size_s": self.binary_artifact.get("window_size_s"),
+                },
+                "multiclass_model_loaded": self.multiclass_artifact is not None,
+                "multiclass_error": self.multiclass_error,
+                "ollama": ollama,
+                "ollama_model": self.args.ollama_model,
+                "validation_warnings": self.warnings,
+                "last_error": last_error,
+            }
+        )
+
+    def build_prediction_only(self, window, mode, t_s):
+        binary_prediction, binary_probabilities = probabilities_for_artifact(window, self.binary_artifact)
+        self.history.append(binary_prediction)
+        alarm = alarm_label(self.history, self.args.alarm_threshold)
+        anomaly_probability = binary_probabilities.get(mf.ANOMALY_LABEL)
+
+        multiclass_prediction = None
+        multiclass_probabilities = {}
+        if self.multiclass_artifact is not None:
+            multiclass_prediction, multiclass_probabilities = probabilities_for_artifact(window, self.multiclass_artifact)
+
+        prediction = json_safe(
+            {
+                "binary_prediction": binary_prediction,
+                "alarm": alarm,
+                "anomaly_probability": anomaly_probability,
+                "binary_probabilities": binary_probabilities,
+                "multiclass_prediction": multiclass_prediction,
+                "multiclass_probabilities": multiclass_probabilities,
+                "history": list(self.history),
+                "alarm_rule": f"{self.args.alarm_threshold}/{self.args.history_size}",
+                "window_size_s": self.window_size,
+            }
+        )
+        return {"telemetry": telemetry_payload(window, mode, t_s), "prediction": prediction}
+
+    def build_xai_bundle(self, window, multiclass_prediction):
+        now = time.perf_counter()
+        if self.cached_xai is not None and now - self.last_xai_time < self.args.xai_interval:
+            return self.cached_xai
+
+        xai = explain_window(
+            window,
+            self.binary_artifact,
+            baseline=self.binary_baseline,
+            focus_label=mf.ANOMALY_LABEL,
+            top_n=5,
+            candidate_features=self.binary_xai_candidates[:5],
+        )
+        multiclass_xai = None
+        if self.multiclass_artifact is not None and self.multiclass_baseline is not None:
+            multiclass_xai = explain_window(
+                window,
+                self.multiclass_artifact,
+                baseline=self.multiclass_baseline,
+                focus_label=multiclass_prediction,
+                top_n=3,
+                candidate_features=self.multiclass_xai_candidates[:3],
+            )
+        self.cached_xai = {
+            "binary": xai,
+            "multiclass": multiclass_xai,
+            "global_top_features": self.binary_global_features[:12],
+        }
+        self.last_xai_time = now
+        return self.cached_xai
+
+    def build_prediction_bundle(self, window, mode, t_s, allow_llm=True):
+        fast = self.build_prediction_only(window, mode, t_s)
+        prediction = fast["prediction"]
+        xai_bundle = self.build_xai_bundle(window, prediction.get("multiclass_prediction"))
+        llm_summary = self.cached_llm
+        if allow_llm:
+            llm_summary = self.build_llm_summary(prediction, xai_bundle["binary"])
+
+        return {
+            "telemetry": fast["telemetry"],
+            "prediction": prediction,
+            "xai": xai_bundle,
+            "llm_summary": llm_summary,
+        }
+
+    def build_llm_summary(self, prediction, binary_xai):
+        now = time.perf_counter()
+        if self.cached_llm is not None and now - self.last_llm_time < self.args.llm_interval:
+            return self.cached_llm
+        llm_payload = {
+            "binary_prediction": prediction,
+            "multiclass_probabilities": prediction.get("multiclass_probabilities", {}),
+            "xai_top_features": binary_xai["top_features"],
+            "sensor_summary": binary_xai["sensor_summary"],
+            "validation_warnings": self.warnings,
+        }
+        llm_summary = generate_operator_summary(
+            llm_payload,
+            model=self.args.ollama_model,
+            endpoint=self.args.ollama_endpoint,
+            timeout=20.0,
+        )
+        self.cached_llm = llm_summary
+        self.last_llm_time = now
+        return llm_summary
+
+
+async def send_event(websocket, event_type, payload):
+    await websocket.send_json({"type": event_type, "payload": json_safe(payload)})
+
+
+def read_sessions():
+    rows = []
+    if not DEFAULT_DATA_DIR.exists():
+        return rows
+    for session_dir in sorted(DEFAULT_DATA_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        summary_path = session_dir / "sync_summary.json"
+        summary = {}
+        if summary_path.exists():
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                summary = {}
+        fused_path = session_dir / "fused_imu_thermal.csv"
+        label = session_dir.name.rstrip("0123456789")
+        if fused_path.exists():
+            try:
+                label = pd.read_csv(fused_path, usecols=["label"])["label"].mode().iloc[0]
+            except Exception:
+                pass
+        rows.append(
+            {
+                "session_id": session_dir.name,
+                "label": str(label),
+                "imu_rows": summary.get("imu_rows"),
+                "thermal_frames": summary.get("thermal_frames"),
+                "fused_rows": summary.get("fused_rows"),
+                "sync_p95_s": summary.get("nearest_thermal_frame_dt_s_p95"),
+                "thermal_interval_s_max": summary.get("thermal_interval_s_max"),
+            }
+        )
+    return json_safe(rows)
+
+
+def read_validation():
+    validation_dir = ROOT / "reports" / "validation"
+    output = {"summary_markdown": "", "loso": [], "family_holdout": [], "time_order": []}
+    summary_path = validation_dir / "validation_summary.md"
+    if summary_path.exists():
+        output["summary_markdown"] = summary_path.read_text(encoding="utf-8")
+    for key, filename in [
+        ("loso", "loso_results.csv"),
+        ("family_holdout", "anomaly_family_holdout.csv"),
+        ("time_order", "time_order_split.csv"),
+    ]:
+        path = validation_dir / filename
+        if path.exists():
+            output[key] = pd.read_csv(path).head(200).to_dict("records")
+    return json_safe(output)
+
+
+def read_modeling():
+    output = {"binary": [], "multiclass": []}
+    for key, path in [
+        ("binary", ROOT / "reports" / "modeling" / "experiment_results.csv"),
+        ("multiclass", ROOT / "reports" / "multiclass" / "experiment_results.csv"),
+    ]:
+        if path.exists():
+            data = pd.read_csv(path)
+            data = data[data["split_type"] == "group_cv"].sort_values("mcc", ascending=False).head(30)
+            output[key] = data.to_dict("records")
+    return json_safe(output)
+
+
+async def stream_replay(websocket, runtime):
+    args = runtime.args
+    data = pd.read_csv(args.replay_session)
+    if "host_elapsed_s" not in data:
+        await send_event(websocket, "status", runtime.status_payload("replay", "Replay CSV must include host_elapsed_s."))
+        return
+
+    data = data.sort_values("host_elapsed_s").reset_index(drop=True)
+    t0 = float(data["host_elapsed_s"].iloc[0])
+    t_end = float(data["host_elapsed_s"].iloc[-1])
+    start = t0
+    last_emit = time.perf_counter()
+    await send_event(websocket, "status", runtime.status_payload("replay"))
+
+    while start + runtime.window_size <= t_end + 1e-9:
+        end = start + runtime.window_size
+        window = data[(data["host_elapsed_s"] >= start) & (data["host_elapsed_s"] < end)].copy()
+        if len(window) >= max(8, int(runtime.window_size * 10)):
+            bundle = runtime.build_prediction_only(window, "replay", end - t0)
+            await send_event(websocket, "telemetry", bundle["telemetry"])
+            await send_event(websocket, "prediction", bundle["prediction"])
+            if runtime.cached_xai is None or time.perf_counter() - runtime.last_xai_time >= runtime.args.xai_interval:
+                xai = await asyncio.to_thread(
+                    runtime.build_xai_bundle,
+                    window,
+                    bundle["prediction"].get("multiclass_prediction"),
+                )
+                await send_event(websocket, "xai", xai)
+                llm_summary = await asyncio.to_thread(
+                    runtime.build_llm_summary,
+                    bundle["prediction"],
+                    xai["binary"],
+                )
+                await send_event(websocket, "llm_summary", llm_summary)
+        if args.replay_speed > 0:
+            elapsed = time.perf_counter() - last_emit
+            await asyncio.sleep(max(0.0, (args.step / args.replay_speed) - elapsed))
+            last_emit = time.perf_counter()
+        else:
+            await asyncio.sleep(0.05)
+        start += args.step
+
+    await send_event(websocket, "status", runtime.status_payload("replay", "Replay completed."))
+
+
+async def stream_live(websocket, runtime):
+    args = runtime.args
+    rows = []
+    latest_thermal = {}
+    next_prediction_s = runtime.window_size
+    next_thermal_s = 0.0
+    start_perf = None
+    await send_event(websocket, "status", runtime.status_payload("live"))
+
+    try:
+        with serial.Serial(args.imu_port, args.baudrate, timeout=0.25, write_timeout=1) as ser:
+            await asyncio.sleep(1.0)
+            prepare_stream(ser, args.soft_reset)
+            ser.reset_input_buffer()
+            start_perf = time.perf_counter()
+            while True:
+                now_s = time.perf_counter() - start_perf
+                try:
+                    line = ser.readline().decode("utf-8", errors="replace").strip()
+                except Exception as exc:
+                    await send_event(websocket, "status", runtime.status_payload("live", f"IMU read failed: {exc}"))
+                    return
+
+                if line:
+                    sample = parse_stream_line(line, label_override="live")
+                    if sample is not None:
+                        sample.pop("raw_line", None)
+                        sample["host_elapsed_s"] = now_s
+                        sample.update(latest_thermal)
+                        rows.append(sample)
+
+                if now_s >= next_thermal_s:
+                    try:
+                        latest_thermal = await asyncio.to_thread(
+                            poll_thermal_once,
+                            args.thermal_host,
+                            args.thermal_port,
+                        )
+                    except Exception as exc:
+                        await send_event(websocket, "status", runtime.status_payload("live", f"Thermal poll failed: {exc}"))
+                    next_thermal_s = now_s + max(0.2, args.thermal_interval)
+
+                if now_s >= next_prediction_s:
+                    frame = pd.DataFrame(rows)
+                    if not frame.empty:
+                        frame = frame[frame["host_elapsed_s"] >= now_s - runtime.window_size].copy()
+                        rows = frame.to_dict("records")
+                        if len(frame) >= max(8, int(runtime.window_size * 10)):
+                            bundle = runtime.build_prediction_only(frame, "live", now_s)
+                            await send_event(websocket, "telemetry", bundle["telemetry"])
+                            await send_event(websocket, "prediction", bundle["prediction"])
+                            if runtime.cached_xai is None or time.perf_counter() - runtime.last_xai_time >= runtime.args.xai_interval:
+                                xai = await asyncio.to_thread(
+                                    runtime.build_xai_bundle,
+                                    frame,
+                                    bundle["prediction"].get("multiclass_prediction"),
+                                )
+                                await send_event(websocket, "xai", xai)
+                                llm_summary = await asyncio.to_thread(
+                                    runtime.build_llm_summary,
+                                    bundle["prediction"],
+                                    xai["binary"],
+                                )
+                                await send_event(websocket, "llm_summary", llm_summary)
+                    next_prediction_s += args.step
+                await asyncio.sleep(0.01)
+    except serial.SerialException as exc:
+        await send_event(websocket, "status", runtime.status_payload("live", format_serial_error(args.imu_port, exc)))
+    except KeyboardInterrupt:
+        return
+
+
+def create_app(runtime):
+    app = FastAPI(title="IoT Motor Fault Live Dashboard")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/health")
+    def health():
+        mode = "replay" if runtime.args.replay_session else "live"
+        return runtime.status_payload(mode)
+
+    @app.get("/api/sessions")
+    def sessions():
+        return read_sessions()
+
+    @app.get("/api/validation")
+    def validation():
+        return read_validation()
+
+    @app.get("/api/modeling")
+    def modeling():
+        return read_modeling()
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        try:
+            if runtime.args.replay_session:
+                await stream_replay(websocket, runtime)
+            elif runtime.args.imu_port:
+                await stream_live(websocket, runtime)
+            else:
+                await send_event(websocket, "status", runtime.status_payload("idle", "No --imu-port or --replay-session provided."))
+                while True:
+                    await asyncio.sleep(5.0)
+        except WebSocketDisconnect:
+            return
+
+    static_dir = ROOT / "dashboard" / "dist"
+    if static_dir.exists():
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="dashboard")
+    return app
+
+
+def once_payload(args):
+    if not args.replay_session:
+        raise SystemExit("--once requires --replay-session")
+    args.llm_interval = 0.0
+    runtime = DashboardRuntime(args)
+    data = pd.read_csv(args.replay_session).sort_values("host_elapsed_s").reset_index(drop=True)
+    t0 = float(data["host_elapsed_s"].iloc[0])
+    t_end = float(data["host_elapsed_s"].iloc[-1])
+    start = t0
+    last_bundle = None
+    while start + runtime.window_size <= t_end + 1e-9:
+        end = start + runtime.window_size
+        window = data[(data["host_elapsed_s"] >= start) & (data["host_elapsed_s"] < end)].copy()
+        if len(window) >= max(8, int(runtime.window_size * 10)):
+            bundle = runtime.build_prediction_bundle(window, "replay", end - t0, allow_llm=True)
+            bundle["status"] = runtime.status_payload("replay_once")
+            last_bundle = bundle
+            if len(runtime.history) >= args.alarm_threshold:
+                return json_safe(bundle)
+        start += args.step
+    if last_bundle is not None:
+        return json_safe(last_bundle)
+    raise SystemExit("No valid replay window found.")
+
+
+def main():
+    args = parse_args()
+    if args.alarm_threshold > args.history_size:
+        raise SystemExit("--alarm-threshold cannot be greater than --history-size")
+    if args.once:
+        print(json.dumps(once_payload(args), indent=2, ensure_ascii=False))
+        return 0
+
+    runtime = DashboardRuntime(args)
+    app = create_app(runtime)
+    print(
+        f"Serving dashboard backend on http://{args.host}:{args.port} "
+        f"mode={'replay' if args.replay_session else 'live' if args.imu_port else 'idle'}",
+        flush=True,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

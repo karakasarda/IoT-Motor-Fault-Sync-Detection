@@ -1,0 +1,12 @@
+               precision    recall  f1-score   support
+
+      damping       0.96      0.99      0.97       207
+         load       0.65      0.67      0.66       278
+mixed_anomaly       0.44      0.50      0.47       137
+       normal       0.97      0.92      0.95       411
+   stall_risk       0.49      0.52      0.51       206
+    vibration       0.87      0.77      0.82       275
+
+     accuracy                           0.77      1514
+    macro avg       0.73      0.73      0.73      1514
+ weighted avg       0.78      0.77      0.77      1514
