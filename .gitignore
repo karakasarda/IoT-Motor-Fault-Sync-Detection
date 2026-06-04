@@ -6,6 +6,11 @@ venv/
 # Local logs and temporary capture artifacts
 *.log
 dashboard_server*.log
+vite*.log
+tmp/
+dashboard/tmp/
+dashboard/node_modules/
+dashboard/dist/
 
 # Keep synchronized summaries/CSV files, skip heavy thermal raw frames.
 data/sync_captures/*/thermal/frame_*.png

@@ -115,3 +115,71 @@ python tools\live_binary_alarm.py --replay-session data\sync_captures\normal1\fu
 ```
 
 The alarm uses a rolling 15-second window and switches to `anomaly` when at least 3 of the last 5 predictions are anomaly.
+
+## Multiclass Modeling
+
+Train the secondary multiclass model after the binary model:
+
+```powershell
+python tools\run_modeling_pipeline.py --data-dir data\sync_captures --target multiclass --windows 2 5 10 15 --seed 42 --model-output models\best_multiclass_model.joblib --report-dir reports\multiclass
+```
+
+The binary model remains the live alarm decision engine. The multiclass model is used as secondary explanation with probabilities for:
+
+- `normal`
+- `vibration`
+- `load`
+- `damping`
+- `stall_risk`
+- `mixed_anomaly`
+
+The multiclass run writes `reports\multiclass\experiment_results.csv`, target-specific confusion matrices, feature importance plots, and `models\best_multiclass_model.joblib`. Model binaries are local generated artifacts and remain ignored by git.
+
+## XAI and Local LLM
+
+XAI uses deterministic feature importance and baseline-replacement probability deltas. SHAP/LIME are intentionally not required.
+
+Example local explanation for the latest window of a replay session:
+
+```powershell
+python tools\xai_explainer.py --session data\sync_captures\mixed_anomaly4\fused_imu_thermal.csv --model models\best_binary_model.joblib --feature-data data\processed\window_features.csv
+```
+
+Local LLM interpretation uses Ollama. The LLM is not a classifier and does not change model decisions; it only summarizes model/XAI output for the operator.
+
+```powershell
+ollama list
+python tools\llm_interpreter.py --model llama3.1:8b --sample
+```
+
+## Web Dashboard
+
+Backend replay mode:
+
+```powershell
+python tools\serve_live_dashboard.py --replay-session data\sync_captures\mixed_anomaly4\fused_imu_thermal.csv --binary-model models\best_binary_model.joblib --multiclass-model models\best_multiclass_model.joblib --ollama-model llama3.1:8b
+```
+
+Backend live mode:
+
+```powershell
+python tools\serve_live_dashboard.py --imu-port COM5 --binary-model models\best_binary_model.joblib --multiclass-model models\best_multiclass_model.joblib --thermal-host 192.168.4.1 --thermal-interval 1.0 --ollama-model llama3.1:8b --soft-reset
+```
+
+Frontend:
+
+```powershell
+cd dashboard
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. The backend WebSocket is expected at `ws://127.0.0.1:8000/ws` in Vite dev mode. If `dashboard\dist` exists, the FastAPI backend can also serve the built dashboard from `http://127.0.0.1:8000`.
+
+The dashboard streams:
+
+- `telemetry`: IMU, pulse, thermal, sample rate
+- `prediction`: binary alarm and multiclass probabilities
+- `xai`: local feature deltas and global feature importance
+- `llm_summary`: Ollama operator summary
+- `status`: COM, tCam, model, Ollama, validation warnings
