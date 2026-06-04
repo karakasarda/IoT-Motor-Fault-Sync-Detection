@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   BarChart3,
   Brain,
+  Clock,
   Cpu,
   Database,
   Gauge,
@@ -72,6 +73,9 @@ const sampleXai = {
 
 const sampleStatus = {
   mode: "idle",
+  server_time: null,
+  server_epoch_ms: null,
+  connected_clients: 0,
   serial_port: null,
   thermal_host: "192.168.4.1",
   binary_model_loaded: false,
@@ -106,6 +110,11 @@ function formatNumber(value, digits = 2) {
 function formatPct(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
   return `${Math.round(Number(value) * 100)}%`;
+}
+
+function formatElapsed(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "n/a";
+  return `t+${Number(value).toFixed(1)}s`;
 }
 
 function App() {
@@ -178,6 +187,11 @@ function App() {
   }, []);
 
   const latest = history[history.length - 1] || {};
+  const serialOk =
+    connection === "connected" &&
+    status.mode !== "idle" &&
+    !status.last_error?.includes("Serial port") &&
+    !status.last_error?.includes("IMU read");
   const views = [
     { id: "live", label: "Live Monitor", icon: Activity },
     { id: "multiclass", label: "Multiclass Model", icon: BarChart3 },
@@ -230,7 +244,7 @@ function App() {
             <StatusChip
               icon={Radio}
               label={status.mode === "replay" ? "Replay" : status.serial_port || "COM"}
-              ok={connection === "connected" && status.mode !== "idle"}
+              ok={serialOk}
             />
             <StatusChip icon={Thermometer} label="tCam" ok={!status.last_error?.includes("Thermal")} />
             <StatusChip icon={Gauge} label="Binary" ok={status.binary_model_loaded} />
@@ -246,6 +260,7 @@ function App() {
             prediction={prediction}
             xai={xai}
             llm={llm}
+            status={status}
             warnings={status.validation_warnings || []}
           />
         )}
@@ -258,11 +273,19 @@ function App() {
   );
 }
 
-function LiveMonitor({ latest, history, prediction, xai, llm, warnings }) {
+function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }) {
   const alarm = prediction.alarm || "normal";
+  const displayTime = latest.server_time || status.server_time || "time";
   return (
     <div className="view-stack">
+      {status.last_error && (
+        <div className="inline-alert">
+          <AlertTriangle size={18} />
+          <span>{status.last_error}</span>
+        </div>
+      )}
       <section className="metric-strip">
+        <Metric icon={Clock} label="elapsed_time" value={formatElapsed(latest.timestamp_s)} unit={displayTime} accent="blue" />
         <Metric icon={Gauge} label="gyro_mag" value={formatNumber(latest.gyro_mag, 2)} unit="dps" accent="cyan" />
         <Metric icon={Activity} label="acc_mag" value={formatNumber(latest.acc_mag, 3)} unit="g" accent="green" />
         <Metric icon={Zap} label="pulse_rate_hz" value={formatNumber(latest.pulse_rate_hz, 2)} unit="Hz" accent="amber" />
@@ -271,7 +294,7 @@ function LiveMonitor({ latest, history, prediction, xai, llm, warnings }) {
 
       <section className="monitor-grid">
         <div className="panel chart-panel">
-          <PanelHeader title="Canlı Telemetri" right={`${formatNumber(latest.sample_rate_hz, 1)} Hz`} />
+          <PanelHeader title="Canlı Telemetri" right={`${formatNumber(latest.sample_rate_hz, 1)} Hz - ${displayTime}`} />
           <TelemetryChart data={history} />
         </div>
         <div className={`panel alarm-panel ${alarm === "anomaly" ? "alarm-hot" : "alarm-calm"}`}>
@@ -424,6 +447,8 @@ function TelemetryChart({ data }) {
   const width = 900;
   const height = 340;
   const padding = 28;
+  const first = data[0] || {};
+  const last = data[data.length - 1] || {};
   const seriesPaths = useMemo(() => {
     return SERIES.map((series) => {
       const values = data.map((row) => Number(row[series.key])).filter((value) => Number.isFinite(value));
@@ -464,6 +489,10 @@ function TelemetryChart({ data }) {
             <em>{series.hasData ? formatNumber(series.max, 2) : "n/a"}</em>
           </span>
         ))}
+      </div>
+      <div className="time-row">
+        <span>{data.length ? `${formatElapsed(first.timestamp_s)} -> ${formatElapsed(last.timestamp_s)}` : "time window waiting"}</span>
+        <strong>{last.server_time ? `last ${last.server_time}` : "last n/a"}</strong>
       </div>
     </div>
   );

@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument("--ollama-endpoint", default="http://127.0.0.1:11434/api/generate")
     parser.add_argument("--llm-interval", type=float, default=5.0)
     parser.add_argument("--xai-interval", type=float, default=3.0)
+    parser.add_argument("--telemetry-interval", type=float, default=0.25)
     parser.add_argument("--replay-speed", type=float, default=0.0, help="0 runs as fast as possible; 1 is realtime.")
     parser.add_argument("--once", action="store_true", help="Emit one replay prediction bundle as JSON and exit.")
     return parser.parse_args()
@@ -98,10 +99,13 @@ def sample_rate(window):
 
 
 def telemetry_payload(window, mode, t_s):
+    server_epoch_s = time.time()
     return json_safe(
         {
             "mode": mode,
             "timestamp_s": safe_float(t_s),
+            "server_epoch_ms": int(server_epoch_s * 1000),
+            "server_time": time.strftime("%H:%M:%S", time.localtime(server_epoch_s)),
             "gyro_mag": latest(window, "gyro_mag"),
             "acc_mag": latest(window, "acc_mag"),
             "pulse_rate_hz": latest(window, "pulse_rate_hz"),
@@ -210,10 +214,14 @@ class DashboardRuntime:
     def status_payload(self, mode, last_error=None):
         if last_error is not None:
             self.latest_live_error = last_error
-        ollama = ollama_status(endpoint=self.args.ollama_endpoint, timeout=1.0)
+        server_epoch_s = time.time()
+        ollama = ollama_status(endpoint=self.args.ollama_endpoint, timeout=0.3)
         return json_safe(
             {
                 "mode": mode,
+                "server_epoch_ms": int(server_epoch_s * 1000),
+                "server_time": time.strftime("%H:%M:%S", time.localtime(server_epoch_s)),
+                "connected_clients": len(self.subscribers),
                 "serial_port": self.args.imu_port,
                 "thermal_host": self.args.thermal_host,
                 "binary_model_loaded": True,
@@ -362,6 +370,26 @@ async def send_event(websocket, event_type, payload):
     await websocket.send_json({"type": event_type, "payload": json_safe(payload)})
 
 
+async def publish_explanations(runtime, frame, prediction):
+    xai = await asyncio.to_thread(
+        runtime.build_xai_bundle,
+        frame,
+        prediction.get("multiclass_prediction"),
+    )
+    runtime.publish("xai", xai)
+    llm_summary = await asyncio.to_thread(
+        runtime.build_llm_summary,
+        prediction,
+        xai["binary"],
+    )
+    runtime.publish("llm_summary", llm_summary)
+
+
+async def build_prediction_async(runtime, frame, mode, t_s):
+    bundle = await asyncio.to_thread(runtime.build_prediction_only, frame, mode, t_s)
+    return frame, bundle
+
+
 def read_sessions():
     rows = []
     if not DEFAULT_DATA_DIR.exists():
@@ -477,26 +505,60 @@ async def live_producer(runtime):
     rows = []
     latest_thermal = {}
     next_prediction_s = runtime.window_size
-    next_telemetry_s = 1.0
+    telemetry_interval = max(0.05, float(args.telemetry_interval))
+    next_telemetry_s = telemetry_interval
     next_thermal_s = max(0.2, args.thermal_interval)
+    thermal_task = None
+    explanation_task = None
+    prediction_task = None
     runtime.publish("status", runtime.status_payload("live"))
 
     while True:
         try:
-            with serial.Serial(args.imu_port, args.baudrate, timeout=0.25, write_timeout=1) as ser:
+            with serial.Serial(args.imu_port, args.baudrate, timeout=0.05, write_timeout=1) as ser:
                 await asyncio.sleep(1.0)
                 prepare_stream(ser, args.soft_reset)
                 ser.reset_input_buffer()
                 start_perf = time.perf_counter()
+                rows = []
+                next_prediction_s = runtime.window_size
+                telemetry_interval = max(0.05, float(args.telemetry_interval))
+                next_telemetry_s = telemetry_interval
+                next_thermal_s = max(0.2, args.thermal_interval)
+                thermal_task = None
+                explanation_task = None
+                prediction_task = None
                 runtime.latest_live_error = None
                 runtime.publish("status", runtime.status_payload("live"))
                 while True:
                     now_s = time.perf_counter() - start_perf
                     try:
-                        line = ser.readline().decode("utf-8", errors="replace").strip()
+                        line_bytes = await asyncio.to_thread(ser.readline)
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
                     except Exception as exc:
                         runtime.publish("status", runtime.status_payload("live", f"IMU read failed: {exc}"))
                         break
+
+                    if prediction_task is not None and prediction_task.done():
+                        try:
+                            prediction_frame, prediction_bundle = prediction_task.result()
+                            runtime.publish("prediction", prediction_bundle["prediction"])
+                            xai_due = (
+                                runtime.cached_xai is None
+                                or time.perf_counter() - runtime.last_xai_time >= runtime.args.xai_interval
+                            )
+                            task_done = explanation_task is None or explanation_task.done()
+                            if xai_due and task_done:
+                                explanation_task = asyncio.create_task(
+                                    publish_explanations(
+                                        runtime,
+                                        prediction_frame.copy(),
+                                        prediction_bundle["prediction"],
+                                    )
+                                )
+                        except Exception as exc:
+                            runtime.publish("status", runtime.status_payload("live", f"Prediction failed: {exc}"))
+                        prediction_task = None
 
                     if line:
                         sample = parse_stream_line(line, label_override="live")
@@ -506,49 +568,43 @@ async def live_producer(runtime):
                             sample.update(latest_thermal)
                             rows.append(sample)
 
+                    if thermal_task is not None and thermal_task.done():
+                        try:
+                            latest_thermal = thermal_task.result()
+                            next_thermal_s = now_s + max(0.2, args.thermal_interval)
+                        except Exception as exc:
+                            runtime.publish("status", runtime.status_payload("live", f"Thermal poll failed: {exc}"))
+                            next_thermal_s = now_s + max(30.0, args.thermal_interval)
+                        thermal_task = None
+
                     if now_s >= next_telemetry_s:
                         frame = pd.DataFrame(rows)
                         if not frame.empty:
                             frame = frame[frame["host_elapsed_s"] >= max(0.0, now_s - runtime.window_size)].copy()
                             rows = frame.to_dict("records")
                             runtime.publish("telemetry", telemetry_payload(frame, "live", now_s))
-                        next_telemetry_s += 1.0
+                        next_telemetry_s = now_s + telemetry_interval
 
-                    if now_s >= next_thermal_s:
-                        try:
-                            latest_thermal = await asyncio.to_thread(
+                    if now_s >= next_thermal_s and thermal_task is None:
+                        thermal_task = asyncio.create_task(
+                            asyncio.to_thread(
                                 poll_thermal_once,
                                 args.thermal_host,
                                 args.thermal_port,
                             )
-                            next_thermal_s = now_s + max(0.2, args.thermal_interval)
-                        except Exception as exc:
-                            runtime.publish("status", runtime.status_payload("live", f"Thermal poll failed: {exc}"))
-                            next_thermal_s = now_s + max(30.0, args.thermal_interval)
+                        )
+                        next_thermal_s = now_s + max(30.0, args.thermal_interval)
 
                     if now_s >= next_prediction_s:
                         frame = pd.DataFrame(rows)
                         if not frame.empty:
                             frame = frame[frame["host_elapsed_s"] >= now_s - runtime.window_size].copy()
                             rows = frame.to_dict("records")
-                            if len(frame) >= max(8, int(runtime.window_size * 10)):
-                                bundle = runtime.build_prediction_only(frame, "live", now_s)
-                                runtime.publish("telemetry", bundle["telemetry"])
-                                runtime.publish("prediction", bundle["prediction"])
-                                if runtime.cached_xai is None or time.perf_counter() - runtime.last_xai_time >= runtime.args.xai_interval:
-                                    xai = await asyncio.to_thread(
-                                        runtime.build_xai_bundle,
-                                        frame,
-                                        bundle["prediction"].get("multiclass_prediction"),
-                                    )
-                                    runtime.publish("xai", xai)
-                                    llm_summary = await asyncio.to_thread(
-                                        runtime.build_llm_summary,
-                                        bundle["prediction"],
-                                        xai["binary"],
-                                    )
-                                    runtime.publish("llm_summary", llm_summary)
-                        next_prediction_s += args.step
+                            if prediction_task is None and len(frame) >= max(8, int(runtime.window_size * 10)):
+                                prediction_task = asyncio.create_task(
+                                    build_prediction_async(runtime, frame.copy(), "live", now_s)
+                                )
+                        next_prediction_s = now_s + args.step
                     await asyncio.sleep(0.01)
         except serial.SerialException as exc:
             runtime.publish("status", runtime.status_payload("live", format_serial_error(args.imu_port, exc)))
