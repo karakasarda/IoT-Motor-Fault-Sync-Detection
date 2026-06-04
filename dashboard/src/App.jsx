@@ -23,32 +23,20 @@ const SERIES = [
   { key: "thermal_mean_c", label: "thermal", color: "#ff7d6b" },
 ];
 
-const sampleHistory = Array.from({ length: 80 }, (_, index) => {
-  const phase = index / 9;
-  return {
-    timestamp_s: index,
-    gyro_mag: 4.5 + Math.sin(phase) * 1.8 + (index > 48 ? 7 : 0),
-    acc_mag: 1.01 + Math.cos(phase * 0.8) * 0.035,
-    pulse_rate_hz: 52 + Math.sin(phase * 0.5) * 4,
-    thermal_mean_c: 31 + index * 0.015,
-    sample_rate_hz: 58,
-  };
-});
-
 const samplePrediction = {
-  alarm: "normal",
-  binary_prediction: "normal",
-  anomaly_probability: 0.12,
-  multiclass_prediction: "normal",
+  alarm: "waiting",
+  binary_prediction: "waiting",
+  anomaly_probability: null,
+  multiclass_prediction: "waiting",
   multiclass_probabilities: {
-    normal: 0.82,
-    vibration: 0.05,
-    load: 0.04,
-    damping: 0.03,
-    stall_risk: 0.02,
-    mixed_anomaly: 0.04,
+    normal: 0,
+    vibration: 0,
+    load: 0,
+    damping: 0,
+    stall_risk: 0,
+    mixed_anomaly: 0,
   },
-  history: ["normal", "normal", "normal", "normal", "normal"],
+  history: [],
   alarm_rule: "3/5",
   window_size_s: 15,
 };
@@ -84,7 +72,7 @@ const sampleXai = {
 
 const sampleStatus = {
   mode: "idle",
-  serial_port: "COM5",
+  serial_port: null,
   thermal_host: "192.168.4.1",
   binary_model_loaded: false,
   multiclass_model_loaded: false,
@@ -124,7 +112,7 @@ function App() {
   const [activeView, setActiveView] = useState("live");
   const [connection, setConnection] = useState("connecting");
   const [status, setStatus] = useState(sampleStatus);
-  const [history, setHistory] = useState(sampleHistory);
+  const [history, setHistory] = useState([]);
   const [prediction, setPrediction] = useState(samplePrediction);
   const [xai, setXai] = useState(sampleXai);
   const [llm, setLlm] = useState({
@@ -239,7 +227,11 @@ function App() {
             <p>Binary alarm ana karar, multiclass olasılıklar ikincil açıklama.</p>
           </div>
           <div className="status-row">
-            <StatusChip icon={Radio} label={status.serial_port || "COM"} ok={connection === "connected"} />
+            <StatusChip
+              icon={Radio}
+              label={status.mode === "replay" ? "Replay" : status.serial_port || "COM"}
+              ok={connection === "connected" && status.mode !== "idle"}
+            />
             <StatusChip icon={Thermometer} label="tCam" ok={!status.last_error?.includes("Thermal")} />
             <StatusChip icon={Gauge} label="Binary" ok={status.binary_model_loaded} />
             <StatusChip icon={BarChart3} label="Multiclass" ok={status.multiclass_model_loaded} />
@@ -448,7 +440,7 @@ function TelemetryChart({ data }) {
         })
         .filter(Boolean)
         .join(" ");
-      return { ...series, points, min, max };
+      return { ...series, points, min, max, hasData: values.length > 0 };
     });
   }, [data]);
 
@@ -469,7 +461,7 @@ function TelemetryChart({ data }) {
           <span key={series.key}>
             <i style={{ background: series.color }} />
             {series.label}
-            <em>{formatNumber(series.max, 2)}</em>
+            <em>{series.hasData ? formatNumber(series.max, 2) : "n/a"}</em>
           </span>
         ))}
       </div>
