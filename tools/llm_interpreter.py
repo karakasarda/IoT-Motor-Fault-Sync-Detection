@@ -10,18 +10,30 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:11434/api/generate"
 DEFAULT_MODEL = "llama3.1:8b"
 
 
-def ollama_status(endpoint=DEFAULT_ENDPOINT, timeout=2.0):
+def ollama_tags_endpoint(endpoint):
+    if endpoint.endswith("/api/generate"):
+        return endpoint[: -len("/api/generate")] + "/api/tags"
+    return endpoint.rstrip("/") + "/api/tags"
+
+
+def ollama_status(endpoint=DEFAULT_ENDPOINT, model=DEFAULT_MODEL, timeout=2.0):
+    tags_endpoint = ollama_tags_endpoint(endpoint)
     try:
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps({"model": DEFAULT_MODEL, "prompt": "ping", "stream": False}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        request = urllib.request.Request(tags_endpoint, method="GET")
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return {"available": response.status == 200, "endpoint": endpoint, "error": None}
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
-        return {"available": False, "endpoint": endpoint, "error": str(exc)}
+            data = json.loads(response.read().decode("utf-8"))
+        models = [str(item.get("name") or item.get("model")) for item in data.get("models", [])]
+        return {
+            "available": response.status == 200,
+            "endpoint": endpoint,
+            "tags_endpoint": tags_endpoint,
+            "model": model,
+            "model_loaded": model in models,
+            "models": models,
+            "error": None,
+        }
+    except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+        return {"available": False, "endpoint": endpoint, "tags_endpoint": tags_endpoint, "model": model, "error": str(exc)}
 
 
 def build_prompt(payload):

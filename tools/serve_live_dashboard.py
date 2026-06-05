@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--ollama-model", default="llama3.1:8b")
     parser.add_argument("--ollama-endpoint", default="http://127.0.0.1:11434/api/generate")
     parser.add_argument("--llm-interval", type=float, default=5.0)
+    parser.add_argument("--llm-timeout", type=float, default=75.0)
     parser.add_argument("--xai-interval", type=float, default=3.0)
     parser.add_argument("--telemetry-interval", type=float, default=0.25)
     parser.add_argument("--replay-speed", type=float, default=0.0, help="0 runs as fast as possible; 1 is realtime.")
@@ -293,7 +294,11 @@ class DashboardRuntime:
         if last_error is not None:
             self.latest_live_error = last_error
         server_epoch_s = time.time()
-        ollama = ollama_status(endpoint=self.args.ollama_endpoint, timeout=0.3)
+        ollama = ollama_status(
+            endpoint=self.args.ollama_endpoint,
+            model=self.args.ollama_model,
+            timeout=1.0,
+        )
         return json_safe(
             {
                 "mode": mode,
@@ -451,7 +456,7 @@ class DashboardRuntime:
             llm_payload,
             model=self.args.ollama_model,
             endpoint=self.args.ollama_endpoint,
-            timeout=20.0,
+            timeout=float(self.args.llm_timeout),
         )
         self.cached_llm = llm_summary
         self.last_llm_time = now
