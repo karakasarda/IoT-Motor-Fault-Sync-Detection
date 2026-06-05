@@ -8,6 +8,7 @@ import pandas as pd
 
 NORMAL_LABEL = "normal"
 ANOMALY_LABEL = "anomaly"
+STOPPED_LABEL = "stopped"
 BINARY_ORDER = [NORMAL_LABEL, ANOMALY_LABEL]
 ANOMALY_SOURCE_LABELS = {"vibration", "load", "damping", "stall_risk", "mixed_anomaly"}
 

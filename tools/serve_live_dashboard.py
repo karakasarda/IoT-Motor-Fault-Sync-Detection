@@ -58,6 +58,12 @@ def parse_args():
     parser.add_argument("--thermal-host", default="192.168.4.1")
     parser.add_argument("--thermal-port", type=int, default=5001)
     parser.add_argument("--thermal-interval", type=float, default=1.0)
+    parser.add_argument("--disable-thermal", action="store_true", help="Do not poll tCam in live mode.")
+    parser.add_argument("--stopped-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--stopped-gyro-std", type=float, default=0.22)
+    parser.add_argument("--stopped-gyro-range", type=float, default=1.20)
+    parser.add_argument("--stopped-acc-std", type=float, default=0.005)
+    parser.add_argument("--stopped-acc-range", type=float, default=0.030)
     parser.add_argument("--ollama-model", default="llama3.1:8b")
     parser.add_argument("--ollama-endpoint", default="http://127.0.0.1:11434/api/generate")
     parser.add_argument("--llm-interval", type=float, default=5.0)
@@ -98,6 +104,24 @@ def sample_rate(window):
     return len(window) / duration
 
 
+def std(window, column):
+    if column not in window or window.empty:
+        return None
+    values = pd.to_numeric(window[column], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return safe_float(values.std(ddof=0))
+
+
+def value_range(window, column):
+    if column not in window or window.empty:
+        return None
+    values = pd.to_numeric(window[column], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return safe_float(values.max() - values.min())
+
+
 def telemetry_payload(window, mode, t_s):
     server_epoch_s = time.time()
     return json_safe(
@@ -114,20 +138,74 @@ def telemetry_payload(window, mode, t_s):
             "sample_rate_hz": sample_rate(window),
             "window_rows": int(len(window)),
             "gyro_mag_mean": mean(window, "gyro_mag"),
+            "gyro_mag_std": std(window, "gyro_mag"),
+            "gyro_mag_range": value_range(window, "gyro_mag"),
             "acc_mag_mean": mean(window, "acc_mag"),
+            "acc_mag_std": std(window, "acc_mag"),
+            "acc_mag_range": value_range(window, "acc_mag"),
             "pulse_rate_hz_mean": mean(window, "pulse_rate_hz"),
         }
     )
 
 
-def probabilities_for_artifact(window, artifact):
+def prediction_for_artifact(window, artifact):
     if artifact is None:
-        return None, {}
-    x, _ = mf.feature_row_for_model(window, artifact)
+        return None, {}, None
+    x, feature_row = mf.feature_row_for_model(window, artifact)
     prediction, probabilities = predict_with_probabilities(artifact, x)
     label_order = [str(label) for label in artifact.get("label_order", probabilities.keys())]
     ordered = {label: float(probabilities.get(label, 0.0)) for label in label_order}
-    return prediction, ordered
+    return prediction, ordered, feature_row
+
+
+def probabilities_for_artifact(window, artifact):
+    prediction, probabilities, _ = prediction_for_artifact(window, artifact)
+    return prediction, probabilities
+
+
+def feature_value(feature_row, column):
+    if feature_row is None or column not in feature_row:
+        return None
+    return safe_float(feature_row[column].iloc[0])
+
+
+def motor_state_from_features(feature_row, args):
+    metrics = {
+        "gyro_mag_std": feature_value(feature_row, "motion__gyro_mag_std"),
+        "gyro_mag_range": feature_value(feature_row, "motion__gyro_mag_range"),
+        "acc_mag_std": feature_value(feature_row, "motion__acc_mag_std"),
+        "acc_mag_range": feature_value(feature_row, "motion__acc_mag_range"),
+        "pulse_rate_hz_mean": feature_value(feature_row, "pulse__rate_hz_mean"),
+        "pulse_rate_zero_frac": feature_value(feature_row, "pulse__rate_zero_frac"),
+    }
+    thresholds = {
+        "gyro_mag_std": float(args.stopped_gyro_std),
+        "gyro_mag_range": float(args.stopped_gyro_range),
+        "acc_mag_std": float(args.stopped_acc_std),
+        "acc_mag_range": float(args.stopped_acc_range),
+    }
+    if not args.stopped_gate:
+        return {"state": "running", "gate_enabled": False, "metrics": metrics, "thresholds": thresholds}
+
+    checks = [
+        metrics["gyro_mag_std"] is not None and metrics["gyro_mag_std"] < thresholds["gyro_mag_std"],
+        metrics["gyro_mag_range"] is not None and metrics["gyro_mag_range"] < thresholds["gyro_mag_range"],
+        metrics["acc_mag_std"] is not None and metrics["acc_mag_std"] < thresholds["acc_mag_std"],
+        metrics["acc_mag_range"] is not None and metrics["acc_mag_range"] < thresholds["acc_mag_range"],
+    ]
+    stopped = all(checks)
+    reason = (
+        "motion variance below running-motor floor"
+        if stopped
+        else "motion variance within running/anomaly evaluation range"
+    )
+    return {
+        "state": mf.STOPPED_LABEL if stopped else "running",
+        "gate_enabled": True,
+        "reason": reason,
+        "metrics": metrics,
+        "thresholds": thresholds,
+    }
 
 
 def alarm_label(history, threshold):
@@ -224,6 +302,7 @@ class DashboardRuntime:
                 "connected_clients": len(self.subscribers),
                 "serial_port": self.args.imu_port,
                 "thermal_host": self.args.thermal_host,
+                "thermal_enabled": not self.args.disable_thermal,
                 "binary_model_loaded": True,
                 "binary_model": {
                     "path": str(self.args.binary_model),
@@ -273,24 +352,37 @@ class DashboardRuntime:
             self.live_task = asyncio.create_task(live_producer(self))
 
     def build_prediction_only(self, window, mode, t_s):
-        binary_prediction, binary_probabilities = probabilities_for_artifact(window, self.binary_artifact)
-        self.history.append(binary_prediction)
-        alarm = alarm_label(self.history, self.args.alarm_threshold)
-        anomaly_probability = binary_probabilities.get(mf.ANOMALY_LABEL)
+        binary_prediction, binary_probabilities, feature_row = prediction_for_artifact(window, self.binary_artifact)
+        motor_state = motor_state_from_features(feature_row, self.args)
+        raw_binary_prediction = binary_prediction
+        raw_anomaly_probability = binary_probabilities.get(mf.ANOMALY_LABEL)
+        anomaly_probability = raw_anomaly_probability
 
         multiclass_prediction = None
         multiclass_probabilities = {}
-        if self.multiclass_artifact is not None:
-            multiclass_prediction, multiclass_probabilities = probabilities_for_artifact(window, self.multiclass_artifact)
+        if motor_state["state"] == mf.STOPPED_LABEL:
+            binary_prediction = mf.STOPPED_LABEL
+            alarm = mf.STOPPED_LABEL
+            anomaly_probability = None
+            multiclass_prediction = "not_running"
+            self.history.append(mf.STOPPED_LABEL)
+        else:
+            self.history.append(binary_prediction)
+            alarm = alarm_label(self.history, self.args.alarm_threshold)
+            if self.multiclass_artifact is not None:
+                multiclass_prediction, multiclass_probabilities = probabilities_for_artifact(window, self.multiclass_artifact)
 
         prediction = json_safe(
             {
                 "binary_prediction": binary_prediction,
                 "alarm": alarm,
                 "anomaly_probability": anomaly_probability,
+                "model_binary_prediction": raw_binary_prediction,
+                "model_anomaly_probability": raw_anomaly_probability,
                 "binary_probabilities": binary_probabilities,
                 "multiclass_prediction": multiclass_prediction,
                 "multiclass_probabilities": multiclass_probabilities,
+                "motor_state": motor_state,
                 "history": list(self.history),
                 "alarm_rule": f"{self.args.alarm_threshold}/{self.args.history_size}",
                 "window_size_s": self.window_size,
@@ -370,7 +462,59 @@ async def send_event(websocket, event_type, payload):
     await websocket.send_json({"type": event_type, "payload": json_safe(payload)})
 
 
+def stopped_xai_bundle(prediction):
+    motor_state = prediction.get("motor_state", {}) or {}
+    metrics = motor_state.get("metrics", {}) or {}
+    thresholds = motor_state.get("thresholds", {}) or {}
+    rows = []
+    for key in ["gyro_mag_std", "gyro_mag_range", "acc_mag_std", "acc_mag_range"]:
+        rows.append(
+            {
+                "feature": f"motor_state__{key}",
+                "family": "motor_state",
+                "value": metrics.get(key),
+                "normal_baseline": thresholds.get(key),
+                "baseline_delta": None
+                if metrics.get(key) is None or thresholds.get(key) is None
+                else float(metrics[key]) - float(thresholds[key]),
+                "focus_probability_delta": 0.0,
+                "direction": "below_running_threshold",
+            }
+        )
+    xai = {
+        "target": "motor_state_gate",
+        "model_name": "pre_model_stopped_gate",
+        "feature_set": "motion_variance",
+        "window_size_s": prediction.get("window_size_s"),
+        "prediction": mf.STOPPED_LABEL,
+        "focus_label": mf.STOPPED_LABEL,
+        "focus_probability": None,
+        "probabilities": {},
+        "top_features": rows,
+        "sensor_summary": metrics,
+        "explanation_confidence": {
+            "max_probability": None,
+            "top_contribution_abs_sum": 0.0,
+            "method": "stopped_gate_motion_threshold",
+        },
+    }
+    return {"binary": xai, "multiclass": None, "global_top_features": []}
+
+
 async def publish_explanations(runtime, frame, prediction):
+    if (prediction.get("motor_state") or {}).get("state") == mf.STOPPED_LABEL:
+        xai = stopped_xai_bundle(prediction)
+        runtime.cached_xai = xai
+        runtime.last_xai_time = time.perf_counter()
+        runtime.publish("xai", xai)
+        llm_summary = await asyncio.to_thread(
+            runtime.build_llm_summary,
+            prediction,
+            xai["binary"],
+        )
+        runtime.publish("llm_summary", llm_summary)
+        return
+
     xai = await asyncio.to_thread(
         runtime.build_xai_bundle,
         frame,
@@ -585,7 +729,7 @@ async def live_producer(runtime):
                             runtime.publish("telemetry", telemetry_payload(frame, "live", now_s))
                         next_telemetry_s = now_s + telemetry_interval
 
-                    if now_s >= next_thermal_s and thermal_task is None:
+                    if not args.disable_thermal and now_s >= next_thermal_s and thermal_task is None:
                         thermal_task = asyncio.create_task(
                             asyncio.to_thread(
                                 poll_thermal_once,

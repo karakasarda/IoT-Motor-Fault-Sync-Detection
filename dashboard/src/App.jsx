@@ -246,7 +246,11 @@ function App() {
               label={status.mode === "replay" ? "Replay" : status.serial_port || "COM"}
               ok={serialOk}
             />
-            <StatusChip icon={Thermometer} label="tCam" ok={!status.last_error?.includes("Thermal")} />
+            <StatusChip
+              icon={Thermometer}
+              label={status.thermal_enabled === false ? "tCam off" : "tCam"}
+              ok={status.thermal_enabled === false || !status.last_error?.includes("Thermal")}
+            />
             <StatusChip icon={Gauge} label="Binary" ok={status.binary_model_loaded} />
             <StatusChip icon={BarChart3} label="Multiclass" ok={status.multiclass_model_loaded} />
             <StatusChip icon={Brain} label="Ollama" ok={status.ollama?.available} />
@@ -275,6 +279,8 @@ function App() {
 
 function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }) {
   const alarm = prediction.alarm || "normal";
+  const alarmClass = alarm === "anomaly" ? "alarm-hot" : alarm === "stopped" ? "alarm-stopped" : "alarm-calm";
+  const motorState = prediction.motor_state || {};
   const displayTime = latest.server_time || status.server_time || "time";
   return (
     <div className="view-stack">
@@ -297,15 +303,33 @@ function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }
           <PanelHeader title="Canlı Telemetri" right={`${formatNumber(latest.sample_rate_hz, 1)} Hz - ${displayTime}`} />
           <TelemetryChart data={history} />
         </div>
-        <div className={`panel alarm-panel ${alarm === "anomaly" ? "alarm-hot" : "alarm-calm"}`}>
-          <PanelHeader title="Binary Alarm" right={`rule ${prediction.alarm_rule || "3/5"}`} />
+        <div className={`panel alarm-panel ${alarmClass}`}>
+          <PanelHeader
+            title="Binary Alarm"
+            right={alarm === "stopped" ? "pre-model stopped gate" : `rule ${prediction.alarm_rule || "3/5"}`}
+          />
           <div className="alarm-state">
             <span>{alarm}</span>
             <strong>{formatPct(prediction.anomaly_probability)}</strong>
           </div>
+          {motorState.state && (
+            <div className="state-note">
+              <strong>motor_state: {motorState.state}</strong>
+              <span>{motorState.reason || "state gate"}</span>
+              {prediction.model_binary_prediction && (
+                <em>
+                  raw model: {prediction.model_binary_prediction} / {formatPct(prediction.model_anomaly_probability)}
+                </em>
+              )}
+            </div>
+          )}
           <div className="history-dots">
             {(prediction.history || []).map((item, index) => (
-              <span key={`${item}-${index}`} className={item === "anomaly" ? "dot hot" : "dot calm"} title={item} />
+              <span
+                key={`${item}-${index}`}
+                className={item === "anomaly" ? "dot hot" : item === "stopped" ? "dot stopped" : "dot calm"}
+                title={item}
+              />
             ))}
           </div>
           <ProbabilityBars probabilities={prediction.multiclass_probabilities || {}} compact />

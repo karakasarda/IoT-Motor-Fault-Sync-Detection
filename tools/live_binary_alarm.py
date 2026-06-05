@@ -31,6 +31,11 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=None, help="Optional live-mode duration in seconds.")
     parser.add_argument("--history-size", type=int, default=5)
     parser.add_argument("--alarm-threshold", type=int, default=3)
+    parser.add_argument("--stopped-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--stopped-gyro-std", type=float, default=0.22)
+    parser.add_argument("--stopped-gyro-range", type=float, default=1.20)
+    parser.add_argument("--stopped-acc-std", type=float, default=0.005)
+    parser.add_argument("--stopped-acc-range", type=float, default=0.030)
     parser.add_argument("--replay-speed", type=float, default=0.0, help="0 runs replay as fast as possible; 1 is realtime.")
     return parser.parse_args()
 
@@ -65,6 +70,36 @@ def predict_window(window, artifact):
 
 def alarm_label(history, threshold):
     return mf.ANOMALY_LABEL if sum(label == mf.ANOMALY_LABEL for label in history) >= threshold else mf.NORMAL_LABEL
+
+
+def feature_value(feature_row, column):
+    if feature_row is None or column not in feature_row:
+        return None
+    try:
+        return float(feature_row[column].iloc[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def stopped_gate(feature_row, args):
+    if not args.stopped_gate:
+        return False
+    metrics = {
+        "gyro_mag_std": feature_value(feature_row, "motion__gyro_mag_std"),
+        "gyro_mag_range": feature_value(feature_row, "motion__gyro_mag_range"),
+        "acc_mag_std": feature_value(feature_row, "motion__acc_mag_std"),
+        "acc_mag_range": feature_value(feature_row, "motion__acc_mag_range"),
+    }
+    return (
+        metrics["gyro_mag_std"] is not None
+        and metrics["gyro_mag_std"] < args.stopped_gyro_std
+        and metrics["gyro_mag_range"] is not None
+        and metrics["gyro_mag_range"] < args.stopped_gyro_range
+        and metrics["acc_mag_std"] is not None
+        and metrics["acc_mag_std"] < args.stopped_acc_std
+        and metrics["acc_mag_range"] is not None
+        and metrics["acc_mag_range"] < args.stopped_acc_range
+    )
 
 
 def latest_value(window, column):
@@ -105,9 +140,12 @@ def run_replay(args, artifact):
         end = start + window_size
         window = data[(data["host_elapsed_s"] >= start) & (data["host_elapsed_s"] < end)].copy()
         if len(window) >= max(8, int(window_size * 10)):
-            pred, anomaly_proba, _ = predict_window(window, artifact)
+            pred, anomaly_proba, feature_row = predict_window(window, artifact)
+            if stopped_gate(feature_row, args):
+                pred = mf.STOPPED_LABEL
+                anomaly_proba = None
             history.append(pred)
-            alarm = alarm_label(history, args.alarm_threshold)
+            alarm = mf.STOPPED_LABEL if pred == mf.STOPPED_LABEL else alarm_label(history, args.alarm_threshold)
             counts[pred] = counts.get(pred, 0) + 1
             alarm_counts[alarm] = alarm_counts.get(alarm, 0) + 1
             predictions += 1
@@ -171,9 +209,12 @@ def run_live(args, artifact):
                         frame = frame[frame["host_elapsed_s"] >= now_s - window_size].copy()
                         rows = frame.to_dict("records")
                         if len(frame) >= max(8, int(window_size * 10)):
-                            pred, anomaly_proba, _ = predict_window(frame, artifact)
+                            pred, anomaly_proba, feature_row = predict_window(frame, artifact)
+                            if stopped_gate(feature_row, args):
+                                pred = mf.STOPPED_LABEL
+                                anomaly_proba = None
                             history.append(pred)
-                            alarm = alarm_label(history, args.alarm_threshold)
+                            alarm = mf.STOPPED_LABEL if pred == mf.STOPPED_LABEL else alarm_label(history, args.alarm_threshold)
                             print_prediction(now_s, frame, pred, anomaly_proba, history, alarm)
                     next_prediction_s += step
     except serial.SerialException as exc:

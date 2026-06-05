@@ -471,6 +471,10 @@ select {
   border-color: rgba(167, 228, 111, 0.28);
 }
 
+.alarm-stopped {
+  border-color: rgba(246, 198, 91, 0.42);
+}
+
 .alarm-state {
   display: grid;
   gap: 10px;
@@ -495,6 +499,34 @@ select {
   color: var(--red);
 }
 
+.alarm-stopped .alarm-state strong {
+  color: var(--amber);
+}
+
+.state-note {
+  display: grid;
+  gap: 4px;
+  margin: 0 16px 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(246, 198, 91, 0.22);
+  border-radius: 8px;
+  background: rgba(246, 198, 91, 0.07);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.state-note strong {
+  color: var(--amber);
+  font-size: 12px;
+}
+
+.state-note em {
+  color: var(--text);
+  font-style: normal;
+  font-size: 12px;
+}
+
 .history-dots {
   display: flex;
   gap: 8px;
@@ -514,6 +546,10 @@ select {
 
 .dot.calm {
   background: var(--green);
+}
+
+.dot.stopped {
+  background: var(--amber);
 }
 
 .prob-bars {
