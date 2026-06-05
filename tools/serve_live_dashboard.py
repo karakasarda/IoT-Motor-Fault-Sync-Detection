@@ -64,6 +64,10 @@ def parse_args():
     parser.add_argument("--stopped-gyro-range", type=float, default=1.20)
     parser.add_argument("--stopped-acc-std", type=float, default=0.005)
     parser.add_argument("--stopped-acc-range", type=float, default=0.030)
+    parser.add_argument("--review-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--review-anomaly-low", type=float, default=0.35)
+    parser.add_argument("--review-anomaly-high", type=float, default=0.85)
+    parser.add_argument("--multiclass-min-confidence", type=float, default=0.65)
     parser.add_argument("--ollama-model", default="llama3.1:8b")
     parser.add_argument("--ollama-endpoint", default="http://127.0.0.1:11434/api/generate")
     parser.add_argument("--llm-interval", type=float, default=5.0)
@@ -206,6 +210,60 @@ def motor_state_from_features(feature_row, args):
         "reason": reason,
         "metrics": metrics,
         "thresholds": thresholds,
+    }
+
+
+def review_policy(raw_binary_prediction, anomaly_probability, raw_multiclass_prediction, multiclass_probabilities, args):
+    top_multiclass_probability = None
+    if multiclass_probabilities:
+        top_multiclass_probability = max(float(value or 0.0) for value in multiclass_probabilities.values())
+
+    if not args.review_gate:
+        return {
+            "state": "model_decision",
+            "gate_enabled": False,
+            "reason": "review gate disabled",
+            "top_multiclass_probability": top_multiclass_probability,
+        }
+
+    low = float(args.review_anomaly_low)
+    high = float(args.review_anomaly_high)
+    is_gap = (
+        raw_binary_prediction == mf.ANOMALY_LABEL
+        and anomaly_probability is not None
+        and low <= float(anomaly_probability) < high
+    )
+    low_multiclass_confidence = (
+        top_multiclass_probability is not None
+        and top_multiclass_probability < float(args.multiclass_min_confidence)
+    )
+    if is_gap or low_multiclass_confidence:
+        reasons = []
+        if is_gap:
+            reasons.append(
+                f"binary anomaly probability {float(anomaly_probability):.2f} is between trained normal/anomaly bands"
+            )
+        if low_multiclass_confidence:
+            reasons.append(
+                f"multiclass top probability {top_multiclass_probability:.2f} is below confidence threshold"
+            )
+        return {
+            "state": mf.REVIEW_LABEL,
+            "gate_enabled": True,
+            "reason": "; ".join(reasons),
+            "anomaly_probability_low": low,
+            "anomaly_probability_high": high,
+            "multiclass_min_confidence": float(args.multiclass_min_confidence),
+            "top_multiclass_probability": top_multiclass_probability,
+        }
+    return {
+        "state": "model_decision",
+        "gate_enabled": True,
+        "reason": "model confidence accepted",
+        "anomaly_probability_low": low,
+        "anomaly_probability_high": high,
+        "multiclass_min_confidence": float(args.multiclass_min_confidence),
+        "top_multiclass_probability": top_multiclass_probability,
     }
 
 
@@ -365,6 +423,8 @@ class DashboardRuntime:
 
         multiclass_prediction = None
         multiclass_probabilities = {}
+        raw_multiclass_prediction = None
+        raw_multiclass_probability = None
         if motor_state["state"] == mf.STOPPED_LABEL:
             binary_prediction = mf.STOPPED_LABEL
             alarm = mf.STOPPED_LABEL
@@ -372,10 +432,39 @@ class DashboardRuntime:
             multiclass_prediction = "not_running"
             self.history.append(mf.STOPPED_LABEL)
         else:
-            self.history.append(binary_prediction)
-            alarm = alarm_label(self.history, self.args.alarm_threshold)
             if self.multiclass_artifact is not None:
-                multiclass_prediction, multiclass_probabilities = probabilities_for_artifact(window, self.multiclass_artifact)
+                raw_multiclass_prediction, multiclass_probabilities = probabilities_for_artifact(
+                    window,
+                    self.multiclass_artifact,
+                )
+                raw_multiclass_probability = (
+                    float(multiclass_probabilities.get(raw_multiclass_prediction, 0.0))
+                    if raw_multiclass_prediction is not None
+                    else None
+                )
+                multiclass_prediction = raw_multiclass_prediction
+            decision_policy = review_policy(
+                raw_binary_prediction,
+                raw_anomaly_probability,
+                raw_multiclass_prediction,
+                multiclass_probabilities,
+                self.args,
+            )
+            if decision_policy["state"] == mf.REVIEW_LABEL:
+                binary_prediction = mf.REVIEW_LABEL
+                alarm = mf.REVIEW_LABEL
+                if raw_multiclass_prediction is not None:
+                    multiclass_prediction = "uncertain"
+                self.history.append(mf.REVIEW_LABEL)
+            else:
+                self.history.append(binary_prediction)
+                alarm = alarm_label(self.history, self.args.alarm_threshold)
+        if motor_state["state"] == mf.STOPPED_LABEL:
+            decision_policy = {
+                "state": mf.STOPPED_LABEL,
+                "gate_enabled": True,
+                "reason": motor_state.get("reason"),
+            }
 
         prediction = json_safe(
             {
@@ -384,10 +473,13 @@ class DashboardRuntime:
                 "anomaly_probability": anomaly_probability,
                 "model_binary_prediction": raw_binary_prediction,
                 "model_anomaly_probability": raw_anomaly_probability,
+                "model_multiclass_prediction": raw_multiclass_prediction,
+                "model_multiclass_probability": raw_multiclass_probability,
                 "binary_probabilities": binary_probabilities,
                 "multiclass_prediction": multiclass_prediction,
                 "multiclass_probabilities": multiclass_probabilities,
                 "motor_state": motor_state,
+                "decision_policy": decision_policy,
                 "history": list(self.history),
                 "alarm_rule": f"{self.args.alarm_threshold}/{self.args.history_size}",
                 "window_size_s": self.window_size,

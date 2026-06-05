@@ -471,7 +471,7 @@ select {
   border-color: rgba(167, 228, 111, 0.28);
 }
 
-.alarm-stopped {
+.alarm-review {
   border-color: rgba(246, 198, 91, 0.42);
 }
 
@@ -499,7 +499,7 @@ select {
   color: var(--red);
 }
 
-.alarm-stopped .alarm-state strong {
+.alarm-review .alarm-state strong {
   color: var(--amber);
 }
 
@@ -548,7 +548,7 @@ select {
   background: var(--green);
 }
 
-.dot.stopped {
+.dot.review {
   background: var(--amber);
 }
 

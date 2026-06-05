@@ -36,6 +36,9 @@ def parse_args():
     parser.add_argument("--stopped-gyro-range", type=float, default=1.20)
     parser.add_argument("--stopped-acc-std", type=float, default=0.005)
     parser.add_argument("--stopped-acc-range", type=float, default=0.030)
+    parser.add_argument("--review-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--review-anomaly-low", type=float, default=0.35)
+    parser.add_argument("--review-anomaly-high", type=float, default=0.85)
     parser.add_argument("--replay-speed", type=float, default=0.0, help="0 runs replay as fast as possible; 1 is realtime.")
     return parser.parse_args()
 
@@ -102,6 +105,12 @@ def stopped_gate(feature_row, args):
     )
 
 
+def review_gate(pred, anomaly_proba, args):
+    if not args.review_gate or pred != mf.ANOMALY_LABEL or anomaly_proba is None:
+        return False
+    return float(args.review_anomaly_low) <= float(anomaly_proba) < float(args.review_anomaly_high)
+
+
 def latest_value(window, column):
     if column not in window or window.empty:
         return float("nan")
@@ -144,8 +153,10 @@ def run_replay(args, artifact):
             if stopped_gate(feature_row, args):
                 pred = mf.STOPPED_LABEL
                 anomaly_proba = None
+            elif review_gate(pred, anomaly_proba, args):
+                pred = mf.REVIEW_LABEL
             history.append(pred)
-            alarm = mf.STOPPED_LABEL if pred == mf.STOPPED_LABEL else alarm_label(history, args.alarm_threshold)
+            alarm = pred if pred in {mf.STOPPED_LABEL, mf.REVIEW_LABEL} else alarm_label(history, args.alarm_threshold)
             counts[pred] = counts.get(pred, 0) + 1
             alarm_counts[alarm] = alarm_counts.get(alarm, 0) + 1
             predictions += 1
@@ -213,8 +224,10 @@ def run_live(args, artifact):
                             if stopped_gate(feature_row, args):
                                 pred = mf.STOPPED_LABEL
                                 anomaly_proba = None
+                            elif review_gate(pred, anomaly_proba, args):
+                                pred = mf.REVIEW_LABEL
                             history.append(pred)
-                            alarm = mf.STOPPED_LABEL if pred == mf.STOPPED_LABEL else alarm_label(history, args.alarm_threshold)
+                            alarm = pred if pred in {mf.STOPPED_LABEL, mf.REVIEW_LABEL} else alarm_label(history, args.alarm_threshold)
                             print_prediction(now_s, frame, pred, anomaly_proba, history, alarm)
                     next_prediction_s += step
     except serial.SerialException as exc:

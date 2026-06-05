@@ -279,8 +279,10 @@ function App() {
 
 function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }) {
   const alarm = prediction.alarm || "normal";
-  const alarmClass = alarm === "anomaly" ? "alarm-hot" : alarm === "stopped" ? "alarm-stopped" : "alarm-calm";
+  const alarmClass =
+    alarm === "anomaly" ? "alarm-hot" : alarm === "stopped" || alarm === "review" ? "alarm-review" : "alarm-calm";
   const motorState = prediction.motor_state || {};
+  const decisionPolicy = prediction.decision_policy || {};
   const displayTime = latest.server_time || status.server_time || "time";
   return (
     <div className="view-stack">
@@ -306,19 +308,30 @@ function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }
         <div className={`panel alarm-panel ${alarmClass}`}>
           <PanelHeader
             title="Binary Alarm"
-            right={alarm === "stopped" ? "pre-model stopped gate" : `rule ${prediction.alarm_rule || "3/5"}`}
+            right={
+              alarm === "stopped"
+                ? "pre-model stopped gate"
+                : alarm === "review"
+                  ? "confidence review gate"
+                  : `rule ${prediction.alarm_rule || "3/5"}`
+            }
           />
           <div className="alarm-state">
             <span>{alarm}</span>
             <strong>{formatPct(prediction.anomaly_probability)}</strong>
           </div>
-          {motorState.state && (
+          {(motorState.state || decisionPolicy.state) && (
             <div className="state-note">
-              <strong>motor_state: {motorState.state}</strong>
-              <span>{motorState.reason || "state gate"}</span>
+              <strong>{alarm === "review" ? `decision: ${decisionPolicy.state}` : `motor_state: ${motorState.state}`}</strong>
+              <span>{alarm === "review" ? decisionPolicy.reason : motorState.reason || "state gate"}</span>
               {prediction.model_binary_prediction && (
                 <em>
                   raw model: {prediction.model_binary_prediction} / {formatPct(prediction.model_anomaly_probability)}
+                </em>
+              )}
+              {prediction.model_multiclass_prediction && (
+                <em>
+                  raw multiclass: {prediction.model_multiclass_prediction} / {formatPct(prediction.model_multiclass_probability)}
                 </em>
               )}
             </div>
@@ -327,7 +340,7 @@ function LiveMonitor({ latest, history, prediction, xai, llm, status, warnings }
             {(prediction.history || []).map((item, index) => (
               <span
                 key={`${item}-${index}`}
-                className={item === "anomaly" ? "dot hot" : item === "stopped" ? "dot stopped" : "dot calm"}
+                className={item === "anomaly" ? "dot hot" : item === "stopped" || item === "review" ? "dot review" : "dot calm"}
                 title={item}
               />
             ))}
